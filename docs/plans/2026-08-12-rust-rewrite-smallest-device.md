@@ -1,365 +1,339 @@
-# Plan: Rust Rewrite for Smallest Phone-Monitored Device
+# Plan: Rust on ESP32 — Phone as the Monitor
 
 > Status: **planning only** — no implementation in this document.
-> Audience: OpenFlight maintainers who may be new to Rust.
-> Goal: Run the launch monitor on the smallest practical device; phone is the display via browser.
+> Audience: OpenFlight maintainers who may be new to Rust (and new to embedded).
+> Goal: Run the launch-monitor brain on an **ESP32**, connect from a phone over WiFi, see shots live.
+> Prior decision update: **ESP32 is the target** (not Pi Zero). That is cooler and smaller — and it forces a deliberate, thinner product than a full Pi port.
 
 ---
 
-## What you are trying to build (plain English)
+## The honest pitch
 
-Today OpenFlight runs on a Raspberry Pi (often Pi 5 + optional touchscreen). The Pi talks to radar hardware, does heavy math (FFT, spin, carry), and serves a React web UI.
+Yes — we can target an ESP32, and it will feel magical: a matchbox-sized board, golf radar plugged in, phone is the screen.
 
-You want:
+But this is **not** “copy the whole Pi app onto a microcontroller.” It is:
 
-1. **Smaller box** — less power, less cost, less bulk than a Pi 5 + screen.
-2. **Phone as the monitor** — open a URL on your phone; see shots live.
-3. **Same behavior** — ball speed, club speed, spin, carry, angles (if hardware present).
-4. **Proof of sameness** — tests that compare Python vs Rust on the **same inputs → same outputs**.
+> **Same OPS243 shot math (proven by golden tests) + WiFi + phone UI, on ESP32-S3.**  
+> Angle radars (IWR6843 / K-LD7), camera, cloud, GSPro, and the full React kiosk UI stay off this device (at least for v1).
 
-Rust is a good fit because it compiles to a single binary, uses little RAM, has no garbage-collector pauses, and works well for serial + DSP + a small web server on tiny Linux boards.
-
-You do **not** need to learn all of Rust before starting. You learn it crate-by-crate while porting pure math first (the part that has the best tests already).
+If we pretend the full Python stack fits unchanged, the project fails. If we scope it as an **ESP32 edition** with shared algorithm goldens, it is achievable and genuinely cool.
 
 ---
 
-## Architectural decisions (recommended defaults)
+## Recommended hardware (be specific)
 
-These are opinionated. Change them only if you consciously disagree — they drive every phase below.
+| Choice | Recommendation | Why |
+|--------|----------------|-----|
+| **Chip** | **ESP32-S3** (not original ESP32, not C3) | Dual core, USB, enough CPU for FFTs, modern `esp-rs` support |
+| **Module** | **S3 with PSRAM + ≥8–16 MB flash** (e.g. N16R8 class: 16 MB flash / 8 MB PSRAM) | 4096 I/Q + FFT workspaces need RAM; UI assets need flash |
+| **Board** | Any S3 DevKit with PSRAM broken out + spare UART | Easy bring-up; later a custom PCB |
+| **Radar link** | OPS243 on **UART** (not USB-host) | ESP32 is not a comfortable USB host; OPS243 already supports UART |
+| **Trigger** | Keep **SEN-14262 GATE → OPS243 HOST_INT** (hardware trigger on radar); ESP32 only receives the dump over UART | Lowest latency; avoids bit-banging HOST_INT from the MCU unless needed |
+| **Fallback trigger** | GATE → ESP32 GPIO → software `S!` dump | Same as today’s `sound-gpio` path |
+| **Phone link** | ESP32 **WiFi soft-AP** named e.g. `OpenFlight` → phone joins → open `http://192.168.4.1/` | No home router required at the range |
+
+**Power:** 5 V for OPS243 + 3.3 V for ESP32/sound board; shared ground. Document a single USB-C PD or barrel supply in bring-up docs (later).
+
+---
+
+## What fits on ESP32 vs what does not
+
+### In scope (ESP32 v1 — “cool path”)
+
+1. OPS243 rolling-buffer dump over UART  
+2. Sound-triggered capture (hardware HOST_INT on radar, or GPIO fallback)  
+3. DSP: ball speed, club speed, impact estimate, spin (start with envelope; multitaper if it fits timing/RAM)  
+4. Carry from existing tables + spin-adjusted carry  
+5. Tiny HTTP server + **plain WebSocket**  
+6. **Slim phone UI** (not the full current React app as-is)  
+7. Mock / simulate-shot for UI without radar  
+8. Optional: small ring of recent shots in RAM / little flash log (not full Pi JSONL sessions)
+
+### Explicitly out of ESP32 v1
+
+| Feature | Why out |
+|---------|---------|
+| **IWR6843** | ~1 Mbaud binary dumps + heavy DOA/LCMF — wrong class of MCU workload |
+| **K-LD7** | Up to 3 Mbaud streaming + dual radar — needs a Linux USB host |
+| Full **React `ui/`** as today | Bundle + Socket.IO + Zustand app is Pi-sized; trim or replace |
+| **Socket.IO** | Too heavy / awkward on MCU; use plain WebSocket |
+| Camera / YOLO | Impossible here |
+| Cloud / GSPro / sim connectors | Network + protocol bulk; later companion or stay on Pi edition |
+| Full session JSONL offline science pipeline | Use phone download of last-N shots JSON instead |
+
+### Product framing (important)
+
+Treat two editions:
+
+| Edition | Hardware | Role |
+|---------|----------|------|
+| **OpenFlight ESP** (this plan) | ESP32-S3 + OPS243 + sound trigger + phone | Portable speed/spin/carry monitor |
+| **OpenFlight Pi** (existing) | Pi + optional IWR/K-LD7 + full UI + sims/cloud | Full lab / sim / angle product |
+
+Shared **DSP goldens** keep the ESP edition honest against Python. The Pi edition can keep evolving separately until/unless you later port more.
+
+---
+
+## Architectural decisions (ESP32 edition)
 
 | Decision | Recommendation | Why |
-|----------|-----------------|-----|
-| **Target device (v1)** | **Raspberry Pi Zero 2 W** (or equivalent ~$15–25 Linux SBC with WiFi + USB/UART) | Smallest board that can run the **full** DSP stack + WiFi web UI without rewriting algorithms into fixed-point MCU code. |
-| **Not v1** | Bare ESP32 / STM32 as the only brain | Can work later for an OPS-only “micro” build, but FFT/spin/IWR math + WiFi server on an MCU is a second product, not a 1:1 port. |
-| **OS** | 64-bit Linux (Raspberry Pi OS Lite) | Keeps serial, WiFi, filesystem logging; Rust targets this easily. |
-| **UI** | **Keep the existing React UI** initially | Phone already works today: browse to `http://<device-ip>:8080`. Rewriting UI in Rust (egui, etc.) adds no product value for “phone as monitor.” |
-| **Phone connection** | Device WiFi **client** on home network first; optional **AP mode** later (“OpenFlight” SSID) | Client mode is simpler; AP mode is better for a range with no router. |
-| **Language split** | Rust = hardware + DSP + HTTP/WebSocket server; TypeScript = UI | Clear boundary; UI tests stay Vitest/Playwright. |
-| **Angle hardware** | Port **OPS243 core first**; then **IWR6843** (current); keep **K-LD7** as optional/legacy crate | Matches product direction (K-LD7 deprecated). |
-| **Out of v1 scope** | Camera/YOLO, FlightWeb cloud upload, GSPro/sim connectors | Port after core shot path is proven; they are adjacent products. |
-| **Python during rewrite** | Keep Python as **oracle** until Rust matches golden vectors | Do not delete Python until parity gates pass. |
-| **Float policy** | `f64` for 1:1 parity with NumPy; optimize to `f32` only after golden tests pass | Correctness first; tiny-device speed later. |
-
-### Why not “smallest MCU possible” as the first target?
-
-The production path does roughly:
-
-- 4096 I + 4096 Q samples @ 30 kHz
-- Many overlapping FFTs (window 128, pad 4096)
-- Envelope / multitaper spin
-- Optional IWR6843 dump DSP (much heavier)
-
-That fits comfortably on a Pi Zero 2 W in Rust. On an ESP32-class MCU you would need algorithm simplification, fixed-point math, and a thinner feature set — a **different product**, not a faithful rewrite. Plan a **Phase Micro** only after Linux-on-Zero parity exists.
+|----------|----------------|-----|
+| **Target** | ESP32-S3 + PSRAM | Cool + smallest practical for this DSP |
+| **Rust style** | **Host-tested `of-dsp` library** + **ESP firmware crate** | You learn/test math on a laptop first; flashing is last |
+| **ESP framework (v1)** | **`esp-idf` + Rust (`std`)** via esp-rs | WiFi + HTTP are far easier than pure `no_std` Embassy for a beginner |
+| **Later optional** | Embassy `no_std` rewrite | Only if you outgrow IDF or want tighter control |
+| **Float policy** | Develop goldens in **`f64` on host**; run **`f32` on device** with documented tolerances | S3 has FP assist; `f64` everywhere blows RAM/time |
+| **UI** | New **slim mobile web UI** (one screen: last shot + short history + club picker) | Fits flash; loads fast on phone over ESP AP |
+| **Phone protocol** | REST for config + **WebSocket** for `shot` events | Simple; easy to test |
+| **AP vs station** | Soft-AP first; station mode later | Range use without a router |
+| **Python** | Remains **oracle** forever for goldens; Pi app can keep shipping | ESP does not replace every feature on day one |
 
 ---
 
-## Mental model for a Rust beginner
+## Mental model for a Rust beginner (ESP-shaped)
 
-Think in **crates** (libraries/packages), not one giant program:
+You will **not** start by fighting the ESP toolchain. Order matters:
 
 ```
-openflight/                 # Cargo workspace
+1) Laptop: of-dsp + golden tests          ← learn Rust here
+2) Laptop: of-ops243 with fake UART       ← still no hardware
+3) ESP: blink + UART echo to OPS243       ← first flash
+4) ESP: dump → DSP → print speeds         ← serial monitor proof
+5) ESP: WiFi AP + WebSocket + slim UI     ← phone moment
+```
+
+### Crate layout
+
+```
+openflight/
 ├── crates/
-│   ├── of-types/           # Shot, ClubType, shared structs (no I/O)
-│   ├── of-dsp/             # FFT, speed, spin, carry, ballistics
-│   ├── of-ops243/          # Serial protocol to OPS243
-│   ├── of-trigger/         # Sound / GPIO / speed triggers
-│   ├── of-iwr6843/         # Angle radar (later)
-│   ├── of-kld7/            # Legacy angle radar (optional)
-│   ├── of-session/         # JSONL session logger
-│   └── of-server/          # HTTP + Socket.IO-compatible WS + static UI
-├── tests/golden/           # Shared .json / .npy fixtures (Python + Rust)
-└── ui/                     # Existing React app (unchanged at first)
+│   ├── of-types/        # Shot, ClubType (no_std-friendly if possible)
+│   ├── of-dsp/          # FFT / speed / spin / carry — runs on host AND esp
+│   ├── of-ops243/       # Protocol parsing + command sequences
+│   ├── of-proto/        # WebSocket JSON schema (shot messages)
+│   └── of-esp/          # Firmware only: WiFi, HTTP, UART drivers, main
+├── tests/golden/        # Shared fixtures (Python + host Rust)
+├── ui-esp/              # Slim phone UI (static files baked into firmware)
+└── ui/                  # Existing full React app — Pi edition (unchanged)
 ```
 
-**How you learn Rust along the way:**
-
-1. Start in `of-types` + `of-dsp` — no serial, no async, just functions + `cargo test`.
-2. Add `of-ops243` with a fake serial trait (same idea as Python mocks).
-3. Add `of-server` last — async Rust is the steepest learning curve; delay it.
-
-Suggested learning path (only what you need): ownership/borrowing → structs/enums → `Result`/`Option` → traits → `cargo test` → then Tokio/async for the server.
+**Learning path:** ownership → structs/enums → `Result` → `cargo test` → then ESP flash tools. Avoid async/Embassy until the phone UI phase.
 
 ---
 
-## Current system (what must be preserved)
+## Data flow (ESP edition)
 
 ```
-SEN-14262 GATE → OPS243 HOST_INT
-       → dump 4096 I/Q
-       → RollingBufferProcessor (FFT → ball/club/spin)
-       → Shot (+ carry)
-       → optional IWR6843 / K-LD7 angles
-       → Flask-SocketIO emit "shot"
-       → React UI on phone/browser
+SEN-14262 GATE ──► OPS243 HOST_INT
+                      │
+                      ▼
+              UART dump (4096 I + 4096 Q) ──► ESP32-S3
+                      │
+                      ▼
+              of-dsp (f32): ball / club / spin / carry
+                      │
+                      ▼
+              WebSocket "shot" JSON
+                      │
+                      ▼
+              Phone browser on OpenFlight WiFi AP
 ```
-
-**Must-port for phone-monitor MVP:**
-
-1. OPS243 rolling-buffer capture + sound trigger
-2. DSP: speed, club, spin, carry tables / spin-adjusted carry
-3. Web server serving `ui/dist` + WebSocket `shot` / session events
-4. Session JSONL logging (for offline analysis continuity)
-5. Mock mode (`simulate_shot`) for UI/dev without hardware
-
-**Defer:** camera, cloud, GSPro/sim, kiosk Chromium, Pi touchscreen paths.
 
 ---
 
-## Test strategy: 1:1 Python ↔ Rust comparison
+## Test strategy: 1:1 where it matters
 
-This is the most important part of the rewrite. Do **not** only “rewrite tests in Rust by hand.” That drifts. Use **shared golden vectors**.
+Same golden-vector idea as before — with ESP reality baked in.
 
 ### Principle
 
-| Layer | Strategy |
-|-------|----------|
-| **Pure algorithms** | Same fixture file → Python assert + Rust assert (identical expected outputs within epsilon) |
-| **Protocol / serial** | Scripted byte streams (recorded or hand-written) → same parsed structs |
-| **Server fusion** | Table-driven cases: Shot + optional angle inputs → same `shot_to_dict` JSON |
-| **UI** | Keep existing Vitest + Playwright; point at Rust server |
-| **Hardware** | Keep `scripts/hardware-test/*` as manual; optional `#[ignore]` Rust smoke tests |
+| Layer | Where it runs | Parity target |
+|-------|---------------|---------------|
+| DSP algorithms | **Host** `cargo test` + **Python pytest** on same fixtures | Strict 1:1 (f64 host); device uses f32 tolerance band |
+| OPS243 protocol | Host tests with scripted bytes | 1:1 with Python fake-serial tests |
+| Firmware smoke | ESP device / QEMU if available | “Dump in → shot JSON out” few cases |
+| Slim UI | Vitest/Playwright against a **host mock WS server** | Behavioral, not pixel-perfect vs full UI |
 
-### Step 0 before any Rust DSP (do this in Python first)
+### Phase 0 goldens (still do first, in Python)
 
-Export goldens from the existing suite so Rust can consume them:
+Export from existing suites:
 
-1. **Add a golden exporter** (small Python helper, not a rewrite) that runs key processor paths and writes:
-   - `tests/golden/iq/<name>.json` — I/Q arrays + sample_rate + metadata  
-   - `tests/golden/expected/<name>.json` — ball_speed, club_speed, spin_rpm, impact_idx, carry, etc.
-2. **Prefer deterministic synth** already in `tests/spin_synth.py` and synthetic peaks in `test_rolling_buffer.py`.
-3. **For real captures**, check in a **small curated subset** of session I/Q (anonymized, size-limited) that currently live only in gitignored `session_logs/` — otherwise CI cannot guarantee parity.
-4. **Document float tolerance:** e.g. speeds ±0.01 mph, spin ±1 RPM, or relative 1e-9 for intermediate spectra where applicable.
+- P0: `test_rolling_buffer.py`, spin synth, multitaper (mark multitaper optional on-device), carry, ballistics subset  
+- P1: OPS243 dump parse fixtures  
+- **Waive for ESP:** IWR/K-LD7/server Flask fusion/cloud/sim/camera tests — not part of ESP edition parity
 
-### Mapping: existing Python tests → Rust suites
+### Float / tolerance policy
 
-Priority order for parity (highest value first):
+| Metric | Host f64 vs Python | Device f32 vs golden |
+|--------|--------------------|----------------------|
+| Ball / club speed (mph) | ±0.01 or tighter | ±0.05 (tune after measurement) |
+| Spin (rpm) | ±1 | ±25 or relative band |
+| Carry (yd) | ±0.1 | ±1 |
 
-| Priority | Python source | Rust crate | Kind |
-|----------|---------------|------------|------|
-| P0 | `test_rolling_buffer.py` (~143) | `of-dsp` | Pure / golden |
-| P0 | `test_multitaper_spin.py`, `test_spin_*.py` | `of-dsp` | Pure / golden |
-| P0 | `test_launch_monitor.py`, `test_ballistics.py`, `test_speed_correction.py`, `test_spin_estimate.py` | `of-types` / `of-dsp` | Pure |
-| P1 | `test_ops243*.py`, UART/baud/rearm/deadlock | `of-ops243` | Fake serial |
-| P1 | Trigger tests inside `test_rolling_buffer.py` + sound-trigger deadlock | `of-trigger` | Mocked |
-| P1 | `test_session_logger.py` | `of-session` | Temp dir I/O |
-| P2 | IWR: `test_iwr6843_pipeline.py` + related pure tests | `of-iwr6843` | Pure / golden |
-| P2 | K-LD7: `test_kld7_radc_lib.py`, geometry, two-ray | `of-kld7` | Pure (legacy) |
-| P2 | `test_server.py` shot fusion / `shot_to_dict` / angle gates | `of-server` | Integration |
-| P3 | Cloud / GSPro / sim / camera / diagnose scripts | later crates | Optional |
-| Keep | `ui/**/*.test.*`, Playwright e2e | UI | Point at Rust `:8080` |
+Document every loosened tolerance in the waiver table — that is still “engineered enough,” not hand-wavy.
 
-### Parity gate (definition of “ported”)
+### Definition of “ported” for ESP
 
-A module is done only when:
-
-- [ ] Every P0/P1 Python test case for that module has a Rust counterpart **or** an explicit waiver listed in this plan’s waiver table.
-- [ ] Golden fixtures that exist are asserted in **both** languages in CI.
-- [ ] A CI job runs `uv run pytest` (oracle) **and** `cargo test` (port) on the same goldens.
-
-### Known gaps to close *before* claiming 1:1 (still in Python)
-
-These are weak/untested today; fix or waive explicitly:
-
-| Gap | Action for rewrite honesty |
-|-----|----------------------------|
-| Live HOST_INT / persist rolling buffer | Keep as hardware scripts; not CI parity |
-| Real OPS243 E2E | Record one golden dump byte stream for fake-serial tests |
-| Sparse in-repo I/Q corpora | Check in curated goldens |
-| No property-based tests | Optional later (`proptest` / Hypothesis); not required for 1:1 |
-| UI stores / socketService lightly tested | Keep UI as-is; e2e against Rust server |
+- [ ] Every **in-scope** P0 algorithm has host Rust tests on shared goldens  
+- [ ] ESP firmware uses the **same `of-dsp` code path** (not a second rewrite)  
+- [ ] At least one on-device (or hardware-in-loop) test: recorded dump bytes → shot fields within f32 band  
+- [ ] Out-of-scope Python tests listed as **waived for ESP edition**, not silently ignored  
 
 ---
 
-## Device sizing reality check
+## DSP constraints on the S3 (so the cool demo actually works)
 
-| Device | Fits full OpenFlight? | Notes |
-|--------|----------------------|-------|
-| **Pi 5** (today) | Yes | Overkill once UI is phone-only |
-| **Pi Zero 2 W** | Yes (recommended v1) | ~512 MB–1 GB RAM; Rust binary + static UI is fine; avoid Chromium kiosk |
-| Pi Zero W (1st gen) | Risky | Single-core / slower; possible for OPS-only, tight for IWR |
-| ESP32-S3 alone | OPS-only “micro” later | Need fixed-point DSP + thinner spin; separate plan |
-| “Smallest possible” MCU + external WiFi | Custom product | Not a line-by-line port |
+Rough budget to design against:
 
-**Phone as monitor on Zero 2 W:**
+| Resource | Constraint | Mitigation |
+|----------|------------|------------|
+| RAM | Internal SRAM is tight | Put I/Q + FFT buffers in **PSRAM**; keep hot loops aware of speed |
+| Time | Shot UX can tolerate ~50–200 ms process | Overlapping FFTs OK; profile before adding multitaper on-device |
+| Flash | UI + firmware share flash | Slim UI; compress assets; no source maps |
+| CPU | Dual core | UART/WiFi on one pattern; DSP on the other (careful locking) |
 
-1. Device joins WiFi (or hosts AP).
-2. Rust serves `ui/dist` on `0.0.0.0:8080`.
-3. Phone opens `http://openflight.local:8080` or the IP.
-4. No touchscreen, no kiosk script required for this product shape.
+**Algorithm staging on device:**
 
-Power/size win vs Pi 5 + 7" display is large even before any MCU fantasy.
-
----
-
-## Phased plan (tracer-bullet vertical slices)
-
-Each phase is demoable. Do not start phase N+1 until phase N’s acceptance criteria pass.
-
-### Phase 0 — Golden harness (Python only)
-
-**User story:** “I can prove algorithm outputs with files that Rust will later load.”
-
-**What to build:** Exporter + initial golden set from rolling-buffer + spin + carry + ballistics cases; CI job that validates goldens still match Python.
-
-**Acceptance criteria:**
-
-- [ ] ≥ 20 goldens covering ball speed, club speed, spin accept/reject rails, carry table, ballistic carry
-- [ ] Documented schema for fixture JSON
-- [ ] Pytest reads goldens (not only regenerates them)
+1. **Must:** standard + overlapping FFT speed path, club speed, impact, carry tables  
+2. **Should:** envelope spin with existing validation rails  
+3. **Could:** multitaper spin (port for host parity first; enable on ESP only if timing OK)  
+4. **Won’t (v1):** full ballistics RK4 every shot if table carry is enough for phone UI (optional later)
 
 ---
 
-### Phase 1 — Rust DSP crate + parity
+## Phased plan (tracer bullets)
 
-**User story:** “On my laptop, Rust computes the same shot metrics as Python from the same I/Q.”
+### Phase 0 — Golden harness (Python)
 
-**What to build:** `of-types` + `of-dsp`; port processor / multitaper / carry / ballistics / speed correction / kinematic spin; `cargo test` against goldens.
+**Demo:** fixtures on disk; pytest reads them.
 
-**Acceptance criteria:**
-
-- [ ] All P0 goldens pass in Rust within tolerance
-- [ ] No serial/network code yet
-- [ ] README section: “How to run Python vs Rust parity”
-
-**Beginner note:** This phase teaches Rust with the smallest surface area and the strongest existing tests (`test_rolling_buffer.py`).
+- [ ] ≥ 20 goldens for speed / club / spin rails / carry  
+- [ ] JSON schema documented  
+- [ ] Waiver list for ESP-out-of-scope tests committed  
 
 ---
 
-### Phase 2 — OPS243 + trigger + mock capture path
+### Phase 1 — Host Rust DSP parity
 
-**User story:** “Rust can parse a recorded dump and fake a sound trigger the way unit tests do today.”
+**Demo:** on a laptop, `cargo test` matches Python goldens.
 
-**What to build:** `of-ops243` + `of-trigger` with trait-based serial/GPIO; port fake-serial tests from `test_ops243*.py` and trigger tests.
+- [ ] `of-types` + `of-dsp`  
+- [ ] P0 goldens green in f64  
+- [ ] Feature flag or separate path preparing f32  
 
-**Acceptance criteria:**
-
-- [ ] Baud negotiation / dump parse / rearm / write-timeout behaviors covered
-- [ ] `SoundTrigger` accept/reject + timestamp propagation parity
-- [ ] Integration test: scripted dump → `ProcessedCapture` → `Shot`
+**This is where you learn Rust.** No ESP yet.
 
 ---
 
-### Phase 3 — Thin server + phone UI
+### Phase 2 — OPS243 protocol on host
 
-**User story:** “I open my phone to the device IP and see mock shots; then real shots on a Pi Zero 2 W.”
+**Demo:** scripted UART bytes → `Shot`.
 
-**What to build:** `of-server` serving static `ui/dist`; WebSocket (Socket.IO protocol compatibility **or** a thin adapter — decide below); `simulate_shot`; session logger; mock monitor.
-
-**Critical sub-decision (choose before coding):**
-
-| Option | Pros | Cons |
-|--------|------|------|
-| **A. Speak Socket.IO** (recommended) | Existing UI unchanged | Need Rust Socket.IO server crate or small bridge |
-| **B. Plain WebSocket + change UI** | Simpler Rust | Touches every `socketService` event |
-| **C. Keep tiny Python Socket.IO shim calling Rust DSP via FFI/RPC** | Fastest phone demo | Not a real rewrite; temporary only |
-
-**Recommendation:** **A** for the end state; optional short **C** spike only if Socket.IO in Rust blocks learning.
-
-**Acceptance criteria:**
-
-- [ ] Phone on same WiFi shows live UI
-- [ ] `shot` payload field-compatible with current `shot_to_dict`
-- [ ] Playwright e2e pass against Rust mock server
-- [ ] Session JSONL written with same entry types for core events
+- [ ] Port dump JSON parse, command sequences, rearm behaviors relevant to UART mode  
+- [ ] Trigger accept/reject logic as pure functions  
 
 ---
 
-### Phase 4 — Hardware bring-up on Pi Zero 2 W
+### Phase 3 — ESP bring-up (no phone yet)
 
-**User story:** “OPS243 + sound trigger on the smallest Linux board; phone is the only display.”
+**Demo:** serial monitor prints ball/club/spin after a real or injected dump.
 
-**What to build:** Deployment docs (Lite OS, UART/USB, WiFi, systemd service); replace `start-kiosk.sh` Chromium path with `openflight-rust` service; hardware-test checklist.
-
-**Acceptance criteria:**
-
-- [ ] Cold boot → WiFi → phone connects → swing → shot on phone
-- [ ] Power/size notes documented vs Pi 5 kiosk
-- [ ] Rolling-buffer persist setup still documented (firmware bug unchanged)
+- [ ] Toolchain: esp-rs + flash + monitor documented for beginners  
+- [ ] UART to OPS243 (or inject fixture dump over serial for lab without radar)  
+- [ ] Call `of-dsp` on device; confirm f32 band vs golden  
 
 ---
 
-### Phase 5 — Angle stack (IWR6843 first)
+### Phase 4 — WiFi AP + WebSocket + slim phone UI
 
-**User story:** “Launch angle / aim / club path match Python on goldens, then on device.”
+**Demo:** join `OpenFlight`, open the page, see a live shot.
 
-**What to build:** `of-iwr6843` pure pipeline + monitor wiring into server fusion tests (`test_server.py` angle gates).
-
-**Acceptance criteria:**
-
-- [ ] IWR P2 pure tests / goldens pass
-- [ ] Server fusion parity for vertical/horizontal + carry adjustments
-- [ ] K-LD7 only if you still ship those builds (`of-kld7`)
+- [ ] Soft-AP + static file server from flash  
+- [ ] WebSocket `shot` message (`of-proto`)  
+- [ ] Slim UI: last shot metrics, history list, club select, simulate button  
+- [ ] Host mock server so UI tests run in CI without hardware  
 
 ---
 
-### Phase 6 — Optional product surfaces
+### Phase 5 — Sound trigger hardening + packaging
 
-Cloud upload, GSPro/sim connectors, AP-mode WiFi wizard, mDNS (`openflight.local`).
+**Demo:** hit a ball (or clap/trigger) → phone updates hands-free.
 
-Each gets its own mini-plan; not required for “phone monitor on tiny device.”
-
----
-
-### Phase Micro (future, separate product)
-
-ESP32 (or similar) OPS-only build: fixed-point FFT, reduced spin, BLE or WiFi to phone. **Only after** Phases 0–4 prove algorithm ownership. Do not mix into the 1:1 rewrite.
+- [ ] HOST_INT path verified; GPIO fallback documented  
+- [ ] Rolling-buffer persist setup still required on OPS243 (firmware bug unchanged)  
+- [ ] Power/wiring one-pager  
+- [ ] Enclosure note (optional CAD later)  
 
 ---
 
-## Suggested Cargo / tooling choices (when you do start)
+### Phase 6 — Stretch (only after the phone moment)
 
-| Need | Crate direction | Avoid at first |
-|------|-----------------|----------------|
-| FFT | `rustfft` | Writing your own FFT |
-| Linear algebra / vectors | `ndarray` (NumPy-like) | Premature `nalgebra` for everything |
-| Serial | `serialport` | |
-| HTTP static files | `axum` or `actix-web` | |
-| Async runtime | `tokio` | Learning async before Phase 3 |
-| JSON | `serde` / `serde_json` | |
-| Tests | `cargo test` + shared `tests/golden` | Duplicating numbers in source |
-
-Python stays on `uv` / pytest as the oracle until parity gates pass.
+- Multitaper on-device if profiled OK  
+- Station WiFi mode + mDNS  
+- Phone download of session JSON  
+- Custom PCB  
+- **Not on ESP:** IWR/K-LD7 — keep on Pi edition  
 
 ---
 
-## What “done” looks like for your stated goal
+## Beginner toolchain (when you eventually code)
 
-1. A Pi Zero 2 W (or similar) runs a single Rust binary + `ui/dist`.
-2. User’s phone is the monitor (browser).
-3. OPS243 + sound trigger produce shots with metrics matching Python goldens.
-4. CI runs Python golden checks and Rust golden checks on the same fixtures.
-5. Optional IWR6843 angles on the same device class.
-6. No requirement that the implementer knew Rust at the start — only that each phase is small enough to learn inside.
+You will use roughly:
 
----
+1. **Rustup** + `cargo` on your laptop  
+2. **espup** / esp-rs install for S3  
+3. `cargo test` for goldens (daily driver)  
+4. `cargo espflash` + serial monitor for device  
 
-## Waiver table (fill as you go)
-
-| Python test / area | Waive? | Reason |
-|--------------------|--------|--------|
-| Camera / YOLO | Yes for v1 | Disabled in prod |
-| Chromium kiosk scripts | Yes | Phone replaces display |
-| Missing gitignored session_logs cases | Until goldens checked in | Cannot CI |
-| Hardware-only scripts | Manual only | No device in CI |
+Do **not** start with Embassy + `no_std` + async executors on day one. Get host goldens green first; that success keeps motivation through flashing pain.
 
 ---
 
-## Open choices to confirm before implementation
+## Risks (and how we de-risk)
 
-1. **Device:** Agree Pi Zero 2 W as v1 target? (vs stay on Pi 5 hardware but Rust+phone-only UX)
-2. **Socket.IO:** Keep protocol (A) vs change UI (B)?
-3. **Angle radar in v1:** OPS-only first, or IWR in the first device image?
-4. **K-LD7:** Port for existing customers, or document “Python-only legacy”?
-5. **Golden check-in:** OK to commit curated I/Q fixtures to the repo?
+| Risk | Mitigation |
+|------|------------|
+| “Full UI won’t fit / be slow” | Slim `ui-esp` from day of Phase 4; do not bake full `ui/dist` |
+| PSRAM latency makes DSP late | Profile early in Phase 3; shrink overlap count if needed |
+| Beginner + embedded = stall | Host Phases 0–2 deliverable without a board |
+| Feature envy (angles, sims) | Written waivers; Pi edition remains the full product |
+| f32 drift vs TrackMan expectations | Publish tolerance bands; keep Python oracle |
 
 ---
 
-## Immediate next steps (still no product Rust code)
+## Waiver table (ESP edition)
 
-1. Confirm the five open choices above.
-2. Implement **Phase 0** golden exporter + fixture schema (Python-only).
-3. Scaffold empty Cargo workspace with `of-types` / `of-dsp` and one failing golden test (first Rust code).
-4. Proceed Phase 1 until P0 parity is green.
+| Area | Waive on ESP? | Notes |
+|------|---------------|-------|
+| IWR6843 / K-LD7 | Yes | Pi edition |
+| Full React UI / Socket.IO | Yes | Replaced by slim UI + WS |
+| Camera / cloud / GSPro / sim | Yes | Pi edition |
+| Flask `test_server.py` fusion | Mostly | Replaced by `of-proto` + slim fusion |
+| Multitaper on-device | Soft waive | Required on host; optional on chip |
+| Full JSONL session science | Yes | Last-N shots / phone export instead |
+| Hardware-only scripts | Manual | Same as today |
 
-Until those choices are confirmed, do not start the rewrite proper.
+---
+
+## Open choices left (narrower now)
+
+Device choice is settled: **ESP32-S3 + PSRAM**.
+
+Please confirm:
+
+1. **Board class:** OK to standardize on **S3 with PSRAM + ≥8 MB flash** (N16R8-class)?  
+2. **UI:** Agree to a **new slim phone UI** (not shipping the full current React app on the ESP)?  
+3. **Angles:** Agree ESP v1 is **OPS-only** (speed/spin/carry), angles stay on Pi?  
+4. **Spin depth:** Envelope spin required on device; multitaper host-only until proven?  
+5. **Framework:** OK starting with **esp-idf + Rust std** (easier WiFi) rather than Embassy no_std?
+
+---
+
+## Immediate next steps (still no product firmware)
+
+1. Confirm the five choices above.  
+2. Phase 0: golden exporter + ESP waiver list.  
+3. Phase 1: host `of-dsp` + failing-then-passing golden tests.  
+4. Buy/order an **ESP32-S3 DevKit with PSRAM** so Phase 3 is unblocked when you get there.
+
+Until those are confirmed, do not start firmware — but the direction is now **ESP-first**, and the plan is built around making that cool demo real without lying about scope.
